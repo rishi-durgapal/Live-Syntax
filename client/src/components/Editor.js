@@ -189,6 +189,15 @@ function Editor({ socketRef, roomId, onCodeChange }) {
            selection.anchor.ch !== selection.head.ch);
         
         if (hasSelection) {
+          // Normalize selection order - ensure 'from' is before 'to'
+          let from = selection.anchor;
+          let to = selection.head;
+          
+          // Compare positions and swap if necessary
+          if (from.line > to.line || (from.line === to.line && from.ch > to.ch)) {
+            [from, to] = [to, from];
+          }
+          
           // Create unique class name for this user
           const selectionClass = `remote-selection-${socketId.replace(/[^a-zA-Z0-9]/g, '')}`;
           
@@ -209,8 +218,8 @@ function Editor({ socketRef, roomId, onCodeChange }) {
           
           try {
             const mark = editorRef.current.markText(
-              selection.anchor,
-              selection.head,
+              from,
+              to,
               {
                 className: selectionClass,
                 inclusiveLeft: true,

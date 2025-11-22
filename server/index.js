@@ -283,9 +283,16 @@ app.post("/ai", async (req, res) => {
   }
 
   // Build the message with context
-  const systemMessage = "You are a helpful coding assistant. Provide clear, concise answers about code. When showing code examples, use proper formatting.";
+  const systemMessage = `You are a concise coding assistant. When analyzing code:
+
+Format your response EXACTLY like this:
+Corrected Code:
+[Show only the fixed code here]
+
+Do not add any explanations, comments, or error descriptions. Only output "Corrected Code:" followed by the code on the next line.`;
+  
   const userMessage = code 
-    ? `${prompt}\n\nLanguage: ${language}\nCode:\n${code}`
+    ? `${prompt}\n\nLanguage: ${language}\nCode:\n${code}\n\nProvide only the corrected code.`
     : prompt;
 
   try {
