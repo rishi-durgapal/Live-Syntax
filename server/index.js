@@ -142,9 +142,9 @@ io.on("connection", (socket) => {
     io.to(socketId).emit(ACTIONS.JOIN_REJECTED, { roomId });
   });
 
-  // sync the code
-  socket.on(ACTIONS.CODE_CHANGE, ({ roomId, code }) => {
-    socket.in(roomId).emit(ACTIONS.CODE_CHANGE, { code });
+  // sync the code - broadcast changes to all other users in the room
+  socket.on(ACTIONS.CODE_CHANGE, ({ roomId, code, change }) => {
+    socket.in(roomId).emit(ACTIONS.CODE_CHANGE, { code, change });
   });
   
   // sync cursor positions

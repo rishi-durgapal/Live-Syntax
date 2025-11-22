@@ -83,17 +83,24 @@ function Editor({ socketRef, roomId, onCodeChange }) {
         }
       });
 
-      // Send code changes
-      editor.on("change", (instance, changes) => {
-        const { origin } = changes;
+      // Send code changes - send the actual change delta instead of full code
+      editor.on("change", (instance, changeObj) => {
+        const { origin } = changeObj;
         
         if (origin !== "setValue" && !suppressRemoteChangeRef.current) {
           const code = instance.getValue();
           onCodeChange(code);
           
+          // Send the change delta for better collaboration
           socketRef.current.emit(ACTIONS.CODE_CHANGE, {
             roomId,
             code,
+            change: {
+              from: changeObj.from,
+              to: changeObj.to,
+              text: changeObj.text,
+              origin: changeObj.origin
+            }
           });
         }
       });
@@ -105,20 +112,32 @@ function Editor({ socketRef, roomId, onCodeChange }) {
   // Handle incoming code and cursor changes
   useEffect(() => {
     if (socketRef.current) {
-      // Handle code changes
-      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code }) => {
-        if (code !== null && editorRef.current) {
+      // Handle code changes - apply delta changes instead of replacing entire document
+      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code, change }) => {
+        if (editorRef.current) {
           suppressRemoteChangeRef.current = true;
-          const cursor = editorRef.current.getCursor();
-          const scrollInfo = editorRef.current.getScrollInfo();
           
-          editorRef.current.setValue(code);
-          editorRef.current.setCursor(cursor);
-          editorRef.current.scrollTo(scrollInfo.left, scrollInfo.top);
+          // If we have change delta, apply it; otherwise use full code sync
+          if (change && change.from && change.to && change.text) {
+            editorRef.current.replaceRange(
+              change.text.join('\n'),
+              change.from,
+              change.to,
+              '+input'
+            );
+          } else if (code !== null) {
+            // Fallback to full sync (for initial sync)
+            const cursor = editorRef.current.getCursor();
+            const scrollInfo = editorRef.current.getScrollInfo();
+            
+            editorRef.current.setValue(code);
+            editorRef.current.setCursor(cursor);
+            editorRef.current.scrollTo(scrollInfo.left, scrollInfo.top);
+          }
           
           setTimeout(() => {
             suppressRemoteChangeRef.current = false;
-          }, 50);
+          }, 10);
         }
       });
 
