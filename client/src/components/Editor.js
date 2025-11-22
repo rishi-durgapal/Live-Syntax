@@ -51,6 +51,7 @@ function Editor({ socketRef, roomId, onCodeChange }) {
   const editorRef = useRef(null);
   const remoteCursorsRef = useRef({}); // Track remote cursor widgets
   const remoteSelectionsRef = useRef({}); // Track remote selections
+  const suppressRemoteChangeRef = useRef(false); // Flag to prevent circular updates
 
   useEffect(() => {
     const init = async () => {
@@ -70,23 +71,26 @@ function Editor({ socketRef, roomId, onCodeChange }) {
 
       // Send cursor position changes
       editor.on("cursorActivity", () => {
-        const cursor = editor.getCursor();
-        const selection = editor.listSelections()[0];
-        
-        socketRef.current.emit(ACTIONS.CURSOR_CHANGE, {
-          roomId,
-          cursor,
-          selection,
-        });
+        if (!suppressRemoteChangeRef.current) {
+          const cursor = editor.getCursor();
+          const selection = editor.listSelections()[0];
+          
+          socketRef.current.emit(ACTIONS.CURSOR_CHANGE, {
+            roomId,
+            cursor,
+            selection,
+          });
+        }
       });
 
       // Send code changes
       editor.on("change", (instance, changes) => {
         const { origin } = changes;
-        const code = instance.getValue();
-        onCodeChange(code);
         
-        if (origin !== "setValue") {
+        if (origin !== "setValue" && !suppressRemoteChangeRef.current) {
+          const code = instance.getValue();
+          onCodeChange(code);
+          
           socketRef.current.emit(ACTIONS.CODE_CHANGE, {
             roomId,
             code,
@@ -104,9 +108,17 @@ function Editor({ socketRef, roomId, onCodeChange }) {
       // Handle code changes
       socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code }) => {
         if (code !== null && editorRef.current) {
+          suppressRemoteChangeRef.current = true;
           const cursor = editorRef.current.getCursor();
+          const scrollInfo = editorRef.current.getScrollInfo();
+          
           editorRef.current.setValue(code);
           editorRef.current.setCursor(cursor);
+          editorRef.current.scrollTo(scrollInfo.left, scrollInfo.top);
+          
+          setTimeout(() => {
+            suppressRemoteChangeRef.current = false;
+          }, 50);
         }
       });
 
