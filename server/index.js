@@ -239,6 +239,11 @@ io.on("connection", (socket) => {
   });
 });
 
+app.get("/health", async (req, res)=>{ res.json({
+     status:"running",
+    });
+  });
+
 app.post("/compile", async (req, res) => {
   const { code, language, input = "" } = req.body;
 
