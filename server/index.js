@@ -13,17 +13,7 @@ const languageConfig = {
   python3: { pistonLang: 'python', extension: 'py' },
   java: { pistonLang: 'java', extension: 'java' },
   cpp: { pistonLang: 'c++', extension: 'cpp' },
-  nodejs: { pistonLang: 'javascript', extension: 'js' },
   c: { pistonLang: 'c', extension: 'c' },
-  ruby: { pistonLang: 'ruby', extension: 'rb' },
-  go: { pistonLang: 'go', extension: 'go' },
-  scala: { pistonLang: 'scala', extension: 'scala' },
-  bash: { pistonLang: 'bash', extension: 'sh' },
-  csharp: { pistonLang: 'csharp', extension: 'cs' },
-  php: { pistonLang: 'php', extension: 'php' },
-  swift: { pistonLang: 'swift', extension: 'swift' },
-  rust: { pistonLang: 'rust', extension: 'rs' },
-  r: { pistonLang: 'r', extension: 'r' }
 };
 
 // Enable CORS
