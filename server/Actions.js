@@ -13,6 +13,7 @@ const ACTIONS = {
   JOIN_REJECTED: "join-rejected",
   WAITING_FOR_APPROVAL: "waiting-for-approval",
   HOST_CHANGED: "host-changed",
+  CURSOR_CHANGE: "cursor-change",
 };
 
 module.exports = ACTIONS;

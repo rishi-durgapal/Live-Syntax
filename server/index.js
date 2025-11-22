@@ -10,26 +10,20 @@ require("dotenv").config();
 
 const languageConfig = {
   // Piston API language mappings
-  python3: { pistonLang: 'python' },
-  java: { pistonLang: 'java' },
-  cpp: { pistonLang: 'c++' },
-  nodejs: { pistonLang: 'javascript' },
-  c: { pistonLang: 'c' },
-  ruby: { pistonLang: 'ruby' },
-  go: { pistonLang: 'go' },
-  scala: { pistonLang: 'scala' },
-  bash: { pistonLang: 'bash' },
-  csharp: { pistonLang: 'csharp' },
-  php: { pistonLang: 'php' },
-  swift: { pistonLang: 'swift' },
-  rust: { pistonLang: 'rust' },
-  r: { pistonLang: 'r' },
-  // Judge0 IDs (for when subscription activates)
-  judge0Id: {
-    python3: 71, java: 62, cpp: 54, nodejs: 63, c: 50,
-    ruby: 72, go: 60, scala: 81, bash: 46, csharp: 51,
-    php: 68, swift: 83, rust: 73, r: 80
-  }
+  python3: { pistonLang: 'python', extension: 'py' },
+  java: { pistonLang: 'java', extension: 'java' },
+  cpp: { pistonLang: 'c++', extension: 'cpp' },
+  nodejs: { pistonLang: 'javascript', extension: 'js' },
+  c: { pistonLang: 'c', extension: 'c' },
+  ruby: { pistonLang: 'ruby', extension: 'rb' },
+  go: { pistonLang: 'go', extension: 'go' },
+  scala: { pistonLang: 'scala', extension: 'scala' },
+  bash: { pistonLang: 'bash', extension: 'sh' },
+  csharp: { pistonLang: 'csharp', extension: 'cs' },
+  php: { pistonLang: 'php', extension: 'php' },
+  swift: { pistonLang: 'swift', extension: 'swift' },
+  rust: { pistonLang: 'rust', extension: 'rs' },
+  r: { pistonLang: 'r', extension: 'r' }
 };
 
 // Enable CORS
@@ -66,19 +60,13 @@ io.on("connection", (socket) => {
   socket.on(ACTIONS.JOIN, ({ roomId, username }) => {
     userSocketMap[socket.id] = username;
 
-    console.log(`[JOIN] User ${username} (${socket.id}) trying to join room ${roomId}`);
-    console.log(`[JOIN] Current host for room ${roomId}:`, roomHosts[roomId]);
-
     // Check if room exists by checking if there's a host AND the host is still connected
     const currentHost = roomHosts[roomId];
     const hostSocket = currentHost ? io.sockets.sockets.get(currentHost) : null;
     const roomHasActiveHost = currentHost && hostSocket;
 
-    console.log(`[JOIN] Room has active host:`, roomHasActiveHost);
-
     // If room doesn't exist or host is not connected, this user becomes the host and joins directly
     if (!roomHasActiveHost) {
-      console.log(`[JOIN] ${username} is becoming the host of room ${roomId}`);
       // Set as host immediately to prevent race conditions
       roomHosts[roomId] = socket.id;
       socket.join(roomId);
@@ -92,7 +80,6 @@ io.on("connection", (socket) => {
         });
       });
     } else {
-      console.log(`[JOIN] ${username} is requesting to join room ${roomId} (host: ${currentHost})`);
       // Room exists with a host - send join request to host
       if (!pendingJoinRequests[roomId]) {
         pendingJoinRequests[roomId] = [];
@@ -169,6 +156,17 @@ io.on("connection", (socket) => {
   socket.on(ACTIONS.CODE_CHANGE, ({ roomId, code }) => {
     socket.in(roomId).emit(ACTIONS.CODE_CHANGE, { code });
   });
+  
+  // sync cursor positions
+  socket.on(ACTIONS.CURSOR_CHANGE, ({ roomId, cursor, selection }) => {
+    socket.in(roomId).emit(ACTIONS.CURSOR_CHANGE, {
+      socketId: socket.id,
+      username: userSocketMap[socket.id],
+      cursor,
+      selection,
+    });
+  });
+  
   // when new user join the room all the code which are there are also shows on that persons editor
   socket.on(ACTIONS.SYNC_CODE, ({ socketId, code }) => {
     io.to(socketId).emit(ACTIONS.CODE_CHANGE, { code });
@@ -247,63 +245,39 @@ app.get("/health", async (req, res)=>{ res.json({
 app.post("/compile", async (req, res) => {
   const { code, language, input = "" } = req.body;
 
-  // Debug logs
-  console.log('Received compile request:', { code, language, input });
-  console.log('Language config:', languageConfig[language]);
+  if (!languageConfig[language]) {
+    return res.status(400).json({ error: `Unsupported language: ${language}` });
+  }
 
   try {
-    // Try Judge0 first since you have a subscription
-    console.log('Trying Judge0 API...');
-    const submissionResponse = await axios.post("https://judge0-ce.p.rapidapi.com/submissions?base64_encoded=false&wait=true", {
-      source_code: code,
-      language_id: languageConfig.judge0Id[language],
-      stdin: input, // Add input support
+    const { pistonLang, extension } = languageConfig[language];
+    
+    const response = await axios.post("https://emkc.org/api/v2/piston/execute", {
+      language: pistonLang,
+      version: '*',
+      files: [{
+        name: `main.${extension}`,
+        content: code
+      }],
+      stdin: input
     }, {
       headers: {
         'Content-Type': 'application/json',
-        'X-RapidAPI-Host': 'judge0-ce.p.rapidapi.com',
-        'X-RapidAPI-Key': process.env.RAPIDAPI_KEY
       }
     });
 
-    console.log('Judge0 response:', submissionResponse.data);
-    const result = submissionResponse.data;
+    const result = response.data;
+    
     res.json({
-      output: result.stdout || result.stderr || "No output",
-      error: result.stderr || null
+      output: result.run?.stdout || "No output",
+      error: result.run?.stderr || null
     });
 
-  } catch (judge0Error) {
-    console.log('Judge0 failed, trying Piston API as fallback...');
-    console.error('Judge0 error:', judge0Error.response?.data);
-    
-    try {
-      // Fallback to Piston API
-      const response = await axios.post("https://emkc.org/api/v2/piston/execute", {
-        language: languageConfig[language]?.pistonLang || language,
-        version: '*',
-        files: [{
-          name: 'main.' + (language === 'cpp' ? 'cpp' : language === 'java' ? 'java' : language === 'python3' ? 'py' : 'txt'),
-          content: code
-        }],
-        stdin: input // Add input support for Piston too
-      }, {
-        headers: {
-          'Content-Type': 'application/json',
-        }
-      });
-
-      console.log('Piston API response:', response.data);
-      const result = response.data;
-      res.json({
-        output: result.run?.stdout || "No output",
-        error: result.run?.stderr || null
-      });
-
-    } catch (pistonError) {
-      console.error('Both APIs failed:', pistonError.message);
-      res.status(500).json({ error: "Failed to compile code" });
-    }
+  } catch (error) {
+    res.status(500).json({ 
+      error: "Failed to compile code",
+      details: error.response?.data || error.message
+    });
   }
 });
 
@@ -312,10 +286,7 @@ app.post("/ai", async (req, res) => {
   const { prompt = "", code = "", language = "" } = req.body;
   const apiKey = process.env.GROQ_API_KEY;
 
-  console.log('[AI] Request received:', { prompt: prompt.substring(0, 50), language, codeLength: code.length });
-
   if (!apiKey || apiKey === 'your_groq_api_key_here') {
-    console.error('[AI] No API key configured');
     return res.status(500).json({ 
       error: "Groq API key not configured. Get a free key from https://console.groq.com and add it to server/.env as GROQ_API_KEY" 
     });
@@ -328,8 +299,6 @@ app.post("/ai", async (req, res) => {
     : prompt;
 
   try {
-    console.log('[AI] Sending request to Groq...');
-    
     const response = await axios.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
@@ -350,16 +319,9 @@ app.post("/ai", async (req, res) => {
     );
 
     const reply = response.data?.choices?.[0]?.message?.content || "No response generated";
-    console.log('[AI] Success! Reply length:', reply.length);
     return res.json({ reply });
     
   } catch (err) {
-    console.error("[AI] Error:", {
-      status: err?.response?.status,
-      data: err?.response?.data,
-      message: err.message
-    });
-    
     const errorMsg = err?.response?.data?.error?.message || err.message || "AI request failed";
     return res.status(500).json({ 
       error: errorMsg

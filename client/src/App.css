@@ -4,6 +4,17 @@
   line-height: "1.6";
   padding-top: "20px";
 }
+
+/* Remote user selection highlighting */
+.remote-selection {
+  position: relative;
+  z-index: 1;
+}
+
+.CodeMirror-line .remote-selection {
+  background-color: inherit !important;
+}
+
 .compile-window {
   position: fixed;
   bottom: 0;
