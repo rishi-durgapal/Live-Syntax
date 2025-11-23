@@ -60,8 +60,18 @@ const getAllConnectedClients = (roomId) => {
   );
 };
 
+console.log("Allowed origins for CORS/socket.io:", allowedOrigins);
+console.log("FRONTEND_URL env:", process.env.FRONTEND_URL);
+
+io.engine.on("connection_error", (err) => {
+  console.error("Engine connection error:", err.message, {
+    details: err,
+    origin: err.req && err.req.headers && err.req.headers.origin,
+  });
+});
+
 io.on("connection", (socket) => {
-  // console.log('Socket connected', socket.id);
+  console.log("Socket connected:", socket.id, "handshake origin:", socket.handshake.headers.origin);
   socket.on(ACTIONS.JOIN, ({ roomId, username }) => {
     userSocketMap[socket.id] = username;
 
