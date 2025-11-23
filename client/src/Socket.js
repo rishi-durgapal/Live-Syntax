@@ -5,7 +5,7 @@ export const initSocket = async () =>{
         'force new connection': true,
         reconnectionAttempts : 'Infinity',
         timeout: 10000,
-        transports: ['websocket'],
+        transports: ['polling', 'websocket'],
     };
     return io(process.env.REACT_APP_BACKEND_URL, options);
 }
