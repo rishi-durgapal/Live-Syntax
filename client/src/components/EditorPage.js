@@ -42,15 +42,15 @@ function EditorPage() {
 
   useEffect(() => {
     const init = async () => {
-      socketRef.current = await initSocket();
-      socketRef.current.on("connect_error", (err) => handleErrors(err));
-      socketRef.current.on("connect_failed", (err) => handleErrors(err));
-
       const handleErrors = (err) => {
         console.log("Error", err);
         toast.error("Socket connection failed, Try again later");
         navigate("/");
       };
+
+      socketRef.current = await initSocket();
+      socketRef.current.on("connect_error", (err) => handleErrors(err));
+      socketRef.current.on("connect_failed", (err) => handleErrors(err));
 
       socketRef.current.emit(ACTIONS.JOIN, {
         roomId,
