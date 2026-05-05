@@ -29,6 +29,14 @@ const ACTIONS = {
   FILE_DELETE: "file-delete",
   FILE_RENAME: "file-rename",
   FOLDER_CREATE: "folder-create",
+  // Sync & versioning actions
+  REQUEST_FILE_SYNC: "request-file-sync",
+  FILE_SYNC_RESPONSE: "file-sync-response",
+  CODE_CONFLICT: "code-conflict",
+  STALE_EVENT_REJECTED: "stale-event-rejected",
+  SAVE_ERROR: "save-error",
+  RECONNECT_SYNC_START: "reconnect-sync-start",
+  RECONNECT_SYNC_DONE: "reconnect-sync-done",
 };
 
 module.exports = ACTIONS;

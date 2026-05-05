@@ -1,45 +1,54 @@
+/* ═══════════════════════════════════════════
+   FileTabs — VS Code-style tab bar
+   ═══════════════════════════════════════════ */
+
 .file-tabs {
   display: flex;
-  background-color: #252526;
-  border-bottom: 1px solid #2d2d2d;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
   overflow-x: auto;
   overflow-y: hidden;
-  height: 36px;
-  align-items: center;
+  height: 38px;
+  align-items: stretch;
+  gap: 1px;
 }
 
 .file-tabs::-webkit-scrollbar {
-  height: 3px;
+  height: 2px;
 }
 
 .file-tabs::-webkit-scrollbar-thumb {
-  background-color: #424242;
+  background-color: var(--text-muted);
+  border-radius: 2px;
 }
 
 .file-tab {
   display: flex;
   align-items: center;
-  padding: 6px 12px;
-  background-color: #2d2d2d;
-  border-right: 1px solid #1e1e1e;
+  padding: 0 14px;
+  background: transparent;
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
-  font-size: 0.85rem;
-  color: #969696;
-  min-width: 120px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  min-width: 110px;
   max-width: 200px;
-  transition: background-color 0.1s ease;
+  transition: all var(--transition-fast);
+  border-bottom: 2px solid transparent;
+  position: relative;
 }
 
 .file-tab:hover {
-  background-color: #1e1e1e;
+  background: var(--bg-surface);
+  color: var(--text-primary);
 }
 
 .file-tab.active {
-  background-color: #1e1e1e;
-  color: #ffffff;
-  border-bottom: 2px solid #007acc;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-bottom: 2px solid var(--accent);
 }
 
 .file-tab-name {
@@ -47,26 +56,28 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: 'Inter', sans-serif;
 }
 
 .file-tab-close {
   background: none;
   border: none;
-  color: #858585;
-  padding: 0;
+  color: transparent;
+  padding: 2px;
   margin-left: 8px;
   cursor: pointer;
   display: flex;
   align-items: center;
-  font-size: 1rem;
-  opacity: 0;
-  transition: opacity 0.1s ease;
+  font-size: 14px;
+  border-radius: 4px;
+  transition: all var(--transition-fast);
 }
 
 .file-tab:hover .file-tab-close {
-  opacity: 1;
+  color: var(--text-secondary);
 }
 
 .file-tab-close:hover {
-  color: #ffffff;
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
 }

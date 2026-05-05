@@ -5,6 +5,7 @@ import FileExplorer, { getLanguageFromFile } from "./FileExplorer";
 import FileTabs from "./FileTabs";
 import { initSocket } from "../Socket";
 import { ACTIONS } from "../Actions";
+import { SwitchSequencer, generateOpId } from "../syncUtils";
 import {
   useNavigate,
   useLocation,
@@ -51,6 +52,11 @@ function EditorPage() {
   const [isInCall, setIsInCall] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   
+  // Sync state
+  const [syncStatus, setSyncStatus] = useState("green"); // green/yellow/red
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [isFileSyncing, setIsFileSyncing] = useState(false);
+
   // File system state
   const [fileStructure, setFileStructure] = useState(getInitialFileStructure());
   const [openFiles, setOpenFiles] = useState(["/root/index.js"]);
@@ -60,17 +66,28 @@ function EditorPage() {
   });
 
   const codeRef = useRef(null);
+  const editorRef = useRef(null); // ref to Editor component (for flush)
+  const fileVersionsRef = useRef({}); // { filePath: version }
+  const switchSeqRef = useRef(new SwitchSequencer());
+  const fileSyncTimeoutRef = useRef(null);
+  const activeFileRef = useRef(activeFile);
+  // BUG 13: refs that mirror state to avoid stale closures
+  const fileStructureRef = useRef(fileStructure);
+  const fileContentsRef = useRef(fileContents);
+
+  // Keep refs in sync with state (BUG 13 fix)
+  useEffect(() => { fileStructureRef.current = fileStructure; }, [fileStructure]);
+  useEffect(() => { fileContentsRef.current = fileContents; }, [fileContents]);
+  useEffect(() => { activeFileRef.current = activeFile; }, [activeFile]);
 
   // Safeguard: Save current file content before switching
   useEffect(() => {
-    // When activeFile changes, ensure we save the content from codeRef
     return () => {
       if (codeRef.current !== null && activeFile) {
         setFileContents((prevContents) => ({
           ...prevContents,
           [activeFile]: codeRef.current,
         }));
-        console.log("Cleanup save:", { activeFile, code: codeRef.current?.substring(0, 30) });
       }
     };
   }, [activeFile]);
@@ -119,7 +136,6 @@ function EditorPage() {
       socketRef.current.on(
         ACTIONS.JOINED,
         ({ clients, username, socketId }) => {
-          // When we successfully join, hide waiting screen
           setIsWaitingForApproval(false);
           
           if (username !== Location.state?.username) {
@@ -127,10 +143,10 @@ function EditorPage() {
           }
           setClients(clients);
           
-          // Sync file structure to new user
+          // BUG 13 fix: read from refs to avoid stale closure
           socketRef.current.emit(ACTIONS.FILE_STRUCTURE_SYNC, {
-            fileStructure,
-            fileContents,
+            fileStructure: fileStructureRef.current,
+            fileContents: fileContentsRef.current,
             socketId,
           });
         }
@@ -138,28 +154,22 @@ function EditorPage() {
 
       socketRef.current.on(ACTIONS.DISCONNECTED, ({ socketId, username }) => {
         toast.success(`${username} left the room`);
-        setClients((prev) => {
-          return prev.filter((client) => client.socketId !== socketId);
-        });
+        setClients((prev) => prev.filter((client) => client.socketId !== socketId));
       });
 
-      // Handle join requests (for host only)
       socketRef.current.on(ACTIONS.JOIN_REQUEST, ({ socketId, username }) => {
         setJoinRequests((prev) => [...prev, { socketId, username }]);
       });
 
-      // Handle waiting for approval (for non-host users)
       socketRef.current.on(ACTIONS.WAITING_FOR_APPROVAL, () => {
         setIsWaitingForApproval(true);
       });
 
-      // Handle rejection (for users trying to join)
       socketRef.current.on(ACTIONS.JOIN_REJECTED, () => {
         toast.error("The host rejected your request to join the room");
         navigate("/");
       });
 
-      // Handle host change (when current host leaves)
       socketRef.current.on(ACTIONS.HOST_CHANGED, ({ newHostSocketId, newHostUsername, clients }) => {
         setClients(clients);
         if (newHostSocketId === socketRef.current.id) {
@@ -169,54 +179,157 @@ function EditorPage() {
         }
       });
 
-      // Handle file structure sync
+      // Handle file structure sync (only for structural changes, not content)
       socketRef.current.on(ACTIONS.FILE_STRUCTURE_UPDATE, ({ fileStructure: newStructure, fileContents: newContents }) => {
-        console.log("📥 FILE_STRUCTURE_UPDATE received:", { 
-          files: Object.keys(newContents || {}),
-          newContents: newContents
-        });
-        if (newStructure) {
-          console.log("📁 Setting fileStructure:", newStructure);
-          setFileStructure(newStructure);
-        }
+        if (newStructure) setFileStructure(newStructure);
         if (newContents) {
-          // ⚠️ IMPORTANT: REPLACE fileContents completely with MongoDB data only
-          // Do NOT merge - this ensures we only show what's in MongoDB, no stale cached data
-          console.log("💾 FileContents REPLACED with MongoDB data:", { 
-            incomingFiles: Object.keys(newContents),
-            newContents: newContents
-          });
-          setFileContents(newContents);
+          setFileContents((prev) => ({ ...prev, ...newContents }));
+          // Update versions for any new files
+          for (const fp of Object.keys(newContents)) {
+            if (fileVersionsRef.current[fp] === undefined) fileVersionsRef.current[fp] = 0;
+          }
         }
       });
 
-      // Handle code changes from other users
-      // ⚠️ IMPORTANT: Do NOT update fileContents here!
-      // MongoDB (via FILE_STRUCTURE_UPDATE) is the source of truth
-      // CodeMirror shows real-time typing, fileContents is only for file persistence
-      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code, filePath }) => {
-        console.log("📨 CODE_CHANGE received from server:", { filePath, codeLength: code?.length });
-        // Content is already shown in real-time by CodeMirror
-        // Persistence is handled by FILE_STRUCTURE_UPDATE from MongoDB
+      // ── CODE_CHANGE listener (BUG 11 fix: update ALL files) ──
+      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code, filePath, version }) => {
+        if (!filePath) return;
+        // Update fileContents for ALL files (active + background)
+        setFileContents((prev) => ({ ...prev, [filePath]: code }));
+        // Update version tracking
+        if (version !== undefined) {
+          fileVersionsRef.current[filePath] = version;
+        }
       });
+
+      // ── FILE_SYNC_RESPONSE listener (BUGs 3, 5) ──
+      socketRef.current.on(ACTIONS.FILE_SYNC_RESPONSE, ({ filePath, content, version, seq }) => {
+        // FIX 10: Discard stale responses
+        if (!switchSeqRef.current.isValid(seq)) return;
+        if (fileSyncTimeoutRef.current) clearTimeout(fileSyncTimeoutRef.current);
+        setFileContents((prev) => ({ ...prev, [filePath]: content }));
+        fileVersionsRef.current[filePath] = version;
+        setIsFileSyncing(false);
+      });
+
+      // ── CODE_CONFLICT listener (FIX 1: rebase) ──
+      socketRef.current.on(ACTIONS.CODE_CONFLICT, ({ filePath, serverVersion, latestContent }) => {
+        // Update local state with authoritative content
+        fileVersionsRef.current[filePath] = serverVersion;
+        setFileContents((prev) => ({ ...prev, [filePath]: latestContent }));
+
+        // Rebase pending ops (FIX 1)
+        if (editorRef.current) {
+          const queue = editorRef.current.getPendingOpsQueue();
+          const opsForFile = queue.filter(op => op.filePath === filePath);
+          if (opsForFile.length > 0) {
+            let baseVersion = serverVersion;
+            for (const op of opsForFile) {
+              baseVersion += 1;
+              op.version = baseVersion;
+              op.opId = generateOpId();
+            }
+            fileVersionsRef.current[filePath] = baseVersion;
+            // Resend rebased ops
+            for (const op of opsForFile) {
+              socketRef.current.emit(ACTIONS.CODE_CHANGE, {
+                roomId, filePath, code: op.code, change: op.change,
+                version: op.version, opId: op.opId,
+              });
+            }
+          }
+        }
+        toast("Sync conflict resolved — content updated from server", { icon: "⚠️" });
+        setSyncStatus("yellow");
+        setTimeout(() => setSyncStatus("green"), 3000);
+      });
+
+      // ── SAVE_ERROR listener (BUG 9) ──
+      socketRef.current.on(ACTIONS.SAVE_ERROR, ({ filePath, error }) => {
+        toast.error(`Save failed for ${filePath}: ${error}`);
+        setSyncStatus("red");
+        setTimeout(() => setSyncStatus("green"), 5000);
+      });
+
+      // ── Disconnect/Reconnect (BUG 6, FIX 3, FIX 7) ──
+      socketRef.current.on('disconnect', () => {
+        // FIX 7: FLUSH debounce, not cancel
+        if (editorRef.current) editorRef.current.flush();
+        setIsReconnecting(true);
+      });
+
+      socketRef.current.on('reconnect', () => {
+        const currentFile = activeFileRef.current;
+        socketRef.current.emit(ACTIONS.RECONNECT_SYNC_START, { roomId, filePath: currentFile });
+      });
+
+      socketRef.current.on(ACTIONS.RECONNECT_SYNC_DONE, ({ filePath, content, version }) => {
+        // FIX 3: Rebase pending ops instead of clearing
+        fileVersionsRef.current[filePath] = version;
+        setFileContents((prev) => ({ ...prev, [filePath]: content }));
+
+        if (editorRef.current) {
+          const queue = editorRef.current.getPendingOpsQueue();
+          const opsForFile = queue.filter(op => op.filePath === filePath);
+          let baseVersion = version;
+          for (const op of opsForFile) {
+            baseVersion += 1;
+            op.version = baseVersion;
+            op.opId = generateOpId();
+          }
+          fileVersionsRef.current[filePath] = baseVersion;
+          for (const op of opsForFile) {
+            socketRef.current.emit(ACTIONS.CODE_CHANGE, {
+              roomId, filePath, code: op.code, change: op.change,
+              version: op.version, opId: op.opId,
+            });
+          }
+        }
+
+        setIsReconnecting(false);
+        setSyncStatus("green");
+        // Re-join the room
+        socketRef.current.emit(ACTIONS.JOIN, { roomId, username: Location.state?.username });
+      });
+
+      // ── beforeunload: flush pending edits ──
+      const handleBeforeUnload = () => {
+        if (editorRef.current) editorRef.current.flush();
+      };
+      window.addEventListener('beforeunload', handleBeforeUnload);
+
+      // Store cleanup ref for beforeunload
+      socketRef.current._beforeUnloadHandler = handleBeforeUnload;
     };
     init();
 
     return () => {
+      // Cleanup beforeunload
+      if (socketRef.current?._beforeUnloadHandler) {
+        window.removeEventListener('beforeunload', socketRef.current._beforeUnloadHandler);
+      }
       // Cleanup WebRTC before disconnecting socket
       if (webrtcManagerRef.current) {
         webrtcManagerRef.current.cleanup();
       }
-      
-      socketRef.current && socketRef.current.disconnect();
-      socketRef.current.off(ACTIONS.JOINED);
-      socketRef.current.off(ACTIONS.DISCONNECTED);
-      socketRef.current.off(ACTIONS.JOIN_REQUEST);
-      socketRef.current.off(ACTIONS.JOIN_REJECTED);
-      socketRef.current.off(ACTIONS.WAITING_FOR_APPROVAL);
-      socketRef.current.off(ACTIONS.HOST_CHANGED);
-      socketRef.current.off(ACTIONS.FILE_STRUCTURE_UPDATE);
-      socketRef.current.off(ACTIONS.CODE_CHANGE);
+      // BUG 16: Unregister listeners FIRST, then disconnect
+      if (socketRef.current) {
+        socketRef.current.off(ACTIONS.JOINED);
+        socketRef.current.off(ACTIONS.DISCONNECTED);
+        socketRef.current.off(ACTIONS.JOIN_REQUEST);
+        socketRef.current.off(ACTIONS.JOIN_REJECTED);
+        socketRef.current.off(ACTIONS.WAITING_FOR_APPROVAL);
+        socketRef.current.off(ACTIONS.HOST_CHANGED);
+        socketRef.current.off(ACTIONS.FILE_STRUCTURE_UPDATE);
+        socketRef.current.off(ACTIONS.CODE_CHANGE);
+        socketRef.current.off(ACTIONS.FILE_SYNC_RESPONSE);
+        socketRef.current.off(ACTIONS.CODE_CONFLICT);
+        socketRef.current.off(ACTIONS.SAVE_ERROR);
+        socketRef.current.off(ACTIONS.RECONNECT_SYNC_DONE);
+        socketRef.current.off('disconnect');
+        socketRef.current.off('reconnect');
+        socketRef.current.disconnect();
+      }
     };
   }, []);
 
@@ -318,40 +431,60 @@ function EditorPage() {
   };
 
   const handleFileSelect = (path, content) => {
-    setActiveFile(path);
+    // Add to open tabs if not already open
     if (!openFiles.includes(path)) {
-      setOpenFiles([...openFiles, path]);
+      setOpenFiles((prev) => [...prev, path]);
     }
-    if (!fileContents[path]) {
-      setFileContents({ ...fileContents, [path]: content || "" });
+    // Initialize content if this file has never been seen
+    if (!fileContentsRef.current[path]) {
+      setFileContents((prev) => ({ ...prev, [path]: content || "" }));
     }
+    // Delegate to handleTabSelect for proper flush + REQUEST_FILE_SYNC
+    handleTabSelect(path);
   };
 
   const handleTabSelect = (path) => {
-    console.log("🔄 Switching to file:", { path, hasContent: !!fileContents[path], contentLength: fileContents[path]?.length || 0 });
-    
-    // CRITICAL: Save current file content BEFORE switching
-    if (activeFile && codeRef.current !== null) {
-      setFileContents((prevContents) => {
-        const updated = { ...prevContents, [activeFile]: codeRef.current };
-        console.log("💾 SAVED current file before switching:", { activeFile, contentLength: codeRef.current?.length });
-        return updated;
-      });
+    // FIX 10: Flush pending edits for current file
+    if (editorRef.current) editorRef.current.flush();
+
+    // Read content directly from editor (codeRef may not be updated per keystroke)
+    if (activeFile && editorRef.current?.getEditor()) {
+      const currentContent = editorRef.current.getEditor().getValue();
+      codeRef.current = currentContent;
+      setFileContents((prevContents) => ({
+        ...prevContents, [activeFile]: currentContent,
+      }));
+    } else if (activeFile && codeRef.current !== null) {
+      setFileContents((prevContents) => ({
+        ...prevContents, [activeFile]: codeRef.current,
+      }));
     }
-    
-    // Ensure new file is initialized in fileContents before switching tab
+
+    // FIX 10: Increment seq — invalidates any inflight response
+    const seq = switchSeqRef.current.next();
+
+    // Cancel any pending file-sync timeout
+    if (fileSyncTimeoutRef.current) clearTimeout(fileSyncTimeoutRef.current);
+
+    // Optimistic preview from background cache (instant)
     setFileContents((prevContents) => {
-      const updated = { ...prevContents };
-      if (!updated[path]) {
-        console.log("📌 File not in fileContents, initializing with empty string:", { path });
-        updated[path] = "";
-      }
-      console.log("📌 Ready to load file:", { path, keysCount: Object.keys(updated).length });
-      return updated;
+      if (!prevContents[path]) return { ...prevContents, [path]: "" };
+      return prevContents;
     });
-    
-    // Switch to the file tab
     setActiveFile(path);
+
+    // Request authoritative content from server
+    if (socketRef.current) {
+      socketRef.current.emit(ACTIONS.REQUEST_FILE_SYNC, { roomId, filePath: path, seq });
+      setIsFileSyncing(true);
+
+      // FIX 10: Timeout fallback — if server doesn't respond in 3s, use cache
+      fileSyncTimeoutRef.current = setTimeout(() => {
+        if (switchSeqRef.current.isValid(seq)) {
+          setIsFileSyncing(false);
+        }
+      }, 3000);
+    }
   };
 
   const handleCloseFile = (path) => {
@@ -478,28 +611,13 @@ function EditorPage() {
     });
   };
 
+  // BUG 11 fix: handleCodeChange only updates LOCAL state — no socket emit
+  // Editor.js is the sole CODE_CHANGE emitter
   const handleCodeChange = (code, filePath = activeFile) => {
     codeRef.current = code;
-    // Validate filePath before updating
-    if (!filePath) {
-      console.warn("❌ handleCodeChange: filePath is empty, skipping update", { code: code?.substring(0, 30) });
-      return;
-    }
-    console.log("✍️ handleCodeChange called:", { filePath, codeLength: code?.length });
-    
-    // Update fileContents for ACTIVE file only (so user sees their edits while typing)
-    // This file's content will be confirmed by MongoDB via FILE_STRUCTURE_UPDATE
-    setFileContents((prevContents) => {
-      const updated = { ...prevContents, [filePath]: code };
-      return updated;
-    });
-    
-    // Emit CODE_CHANGE to server (and it will broadcast to others)
-    socketRef.current.emit(ACTIONS.CODE_CHANGE, {
-      roomId,
-      code,
-      filePath,
-    });
+    if (!filePath) return;
+    setFileContents((prevContents) => ({ ...prevContents, [filePath]: code }));
+    setSyncStatus("yellow");
   };
 
   const handleApproveJoin = (socketId, username) => {
@@ -673,43 +791,46 @@ function EditorPage() {
         </div>
       )}
 
-      <div style={{ display: 'flex', flexGrow: 1 }}>
-        {/* Left Panel - Members & Explorer */}
+      <div style={{ display: 'flex', flexGrow: 1, background: 'var(--bg-primary)' }}>
+        {/* Left Panel */}
         <div 
           style={{ 
             width: `${leftPanelWidth}%`,
-            backgroundColor: '#1a1d29',
-            color: 'white',
+            background: 'var(--bg-secondary)',
+            color: 'var(--text-primary)',
             display: 'flex',
             flexDirection: 'column',
-            minWidth: '200px',
-            overflow: 'hidden'
+            minWidth: '220px',
+            overflow: 'hidden',
+            borderRight: '1px solid var(--border)',
           }}
         >
-          <img
-            src="/images/LiveSyntaxRectangle.png"
-            alt="Live Syntax Logo"
-            className="img-fluid mx-auto d-block my-3"
-            style={{ maxWidth: "140px" }}
-          />
-          <hr />
-
-          {/* Client list container - Fixed height with scroll */}
-          <div style={{ maxHeight: '200px', minHeight: '100px', overflow: 'auto' }}>
-            <span className="mb-2 d-block">Members</span>
-            {clients.map((client) => (
-              <Client 
-                key={client.socketId} 
-                username={client.username} 
-                isHost={client.isHost}
-                inCall={client.socketId === socketRef.current?.id && isInCall}
-              />
-            ))}
+          {/* Brand */}
+          <div style={{ padding: '16px 16px 12px', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <i className="bi bi-braces" style={{ fontSize: 20, background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }} />
+            <span style={{ fontSize: 16, fontWeight: 700, letterSpacing: '-0.3px' }}>
+              <span style={{ background: 'var(--accent-gradient)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>Live</span> Syntax
+            </span>
           </div>
 
-          <hr />
+          {/* Members */}
+          <div style={{ borderTop: '1px solid var(--border-light)', borderBottom: '1px solid var(--border-light)' }}>
+            <div style={{ padding: '10px 16px 6px', fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.8px' }}>
+              Members · {clients.length}
+            </div>
+            <div style={{ maxHeight: 180, overflowY: 'auto', paddingBottom: 6 }}>
+              {clients.map((client) => (
+                <Client 
+                  key={client.socketId} 
+                  username={client.username} 
+                  isHost={client.isHost}
+                  inCall={client.socketId === socketRef.current?.id && isInCall}
+                />
+              ))}
+            </div>
+          </div>
           
-          {/* File Explorer - Takes remaining space */}
+          {/* File Explorer */}
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}>
             <FileExplorer
               fileStructure={fileStructure}
@@ -721,50 +842,45 @@ function EditorPage() {
             />
           </div>
 
-          <hr />
-          {/* Buttons */}
-          <div style={{ marginTop: 'auto', marginBottom: '1rem' }}>
-            {/* Voice call controls */}
+          {/* Action buttons */}
+          <div style={{ padding: '12px', borderTop: '1px solid var(--border-light)', display: 'flex', flexDirection: 'column', gap: 6 }}>
             {!isInCall ? (
-              <button 
-                className="btn btn-outline-primary w-100 mb-2" 
-                onClick={handleJoinCall}
-                title="Join voice call with room members"
+              <button onClick={handleJoinCall} title="Join voice call with room members" style={{ width: '100%', padding: '8px 12px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--accent)', fontSize: 13, fontWeight: 500, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, transition: 'all var(--transition-fast)', fontFamily: 'Inter, sans-serif' }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--accent-glow)'; e.currentTarget.style.borderColor = 'var(--accent)'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'var(--border)'; }}
               >
-                <i className="bi bi-telephone-fill me-2"></i>
-                Join Call
+                <i className="bi bi-telephone-fill" /> Join Call
               </button>
             ) : (
-              <div className="mb-2">
-                <button 
-                  className="btn btn-danger w-100 mb-2" 
-                  onClick={handleLeaveCall}
-                  title="Leave voice call"
-                >
-                  <i className="bi bi-telephone-x-fill me-2"></i>
-                  Leave Call
+              <>
+                <button onClick={handleLeaveCall} title="Leave voice call" style={{ width: '100%', padding: '8px 12px', background: 'rgba(248,81,73,0.1)', border: '1px solid var(--danger)', borderRadius: 'var(--radius-sm)', color: 'var(--danger)', fontSize: 13, fontWeight: 500, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, fontFamily: 'Inter, sans-serif' }}>
+                  <i className="bi bi-telephone-x-fill" /> Leave Call
                 </button>
-                <button 
-                  className={`btn ${isMuted ? 'btn-warning' : 'btn-outline-secondary'} w-100`}
-                  onClick={handleToggleMute}
-                  title={isMuted ? "Unmute microphone" : "Mute microphone"}
-                >
-                  <i className={`bi ${isMuted ? 'bi-mic-mute-fill' : 'bi-mic-fill'} me-2`}></i>
-                  {isMuted ? 'Unmute' : 'Mute'}
+                <button onClick={handleToggleMute} title={isMuted ? "Unmute" : "Mute"} style={{ width: '100%', padding: '8px 12px', background: isMuted ? 'rgba(210,153,34,0.1)' : 'transparent', border: `1px solid ${isMuted ? 'var(--warning)' : 'var(--border)'}`, borderRadius: 'var(--radius-sm)', color: isMuted ? 'var(--warning)' : 'var(--text-secondary)', fontSize: 13, fontWeight: 500, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, fontFamily: 'Inter, sans-serif' }}>
+                  <i className={`bi ${isMuted ? 'bi-mic-mute-fill' : 'bi-mic-fill'}`} /> {isMuted ? 'Unmute' : 'Mute'}
                 </button>
-              </div>
+              </>
             )}
-            
-            <button className="btn btn-outline-info w-100 mb-2" onClick={handleSaveProject}>
-              <i className="bi bi-cloud-arrow-up me-2"></i>
-              Save Project
+            <button onClick={handleSaveProject} style={{ width: '100%', padding: '8px 12px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text-secondary)', fontSize: 13, fontWeight: 500, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, transition: 'all var(--transition-fast)', fontFamily: 'Inter, sans-serif' }}
+              onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-surface)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
+              onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-secondary)'; }}
+            >
+              <i className="bi bi-cloud-arrow-up" /> Save Project
             </button>
-            <button className="btn btn-outline-success w-100 mb-2" onClick={copyRoomId}>
-              Copy Room ID
-            </button>
-            <button className="btn btn-outline-danger w-100" onClick={leaveRoom}>
-              Leave Room
-            </button>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button onClick={copyRoomId} style={{ flex: 1, padding: '8px 12px', background: 'transparent', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text-secondary)', fontSize: 13, fontWeight: 500, cursor: 'pointer', transition: 'all var(--transition-fast)', fontFamily: 'Inter, sans-serif' }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-surface)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-secondary)'; }}
+              >
+                <i className="bi bi-copy me-1" /> Copy ID
+              </button>
+              <button onClick={leaveRoom} style={{ flex: 1, padding: '8px 12px', background: 'transparent', border: '1px solid rgba(248,81,73,0.3)', borderRadius: 'var(--radius-sm)', color: 'var(--danger)', fontSize: 13, fontWeight: 500, cursor: 'pointer', transition: 'all var(--transition-fast)', fontFamily: 'Inter, sans-serif' }}
+                onMouseEnter={e => e.currentTarget.style.background = 'rgba(248,81,73,0.08)'}
+                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+              >
+                <i className="bi bi-box-arrow-left me-1" /> Leave
+              </button>
+            </div>
           </div>
         </div>
 
@@ -772,8 +888,8 @@ function EditorPage() {
         <div
           onMouseDown={() => setIsResizingLeft(true)}
           style={{
-            width: '5px',
-            backgroundColor: isResizingLeft ? '#0d6efd' : '#495057',
+            width: 3,
+            backgroundColor: isResizingLeft ? 'var(--accent)' : 'var(--border)',
             cursor: 'col-resize',
             transition: isResizingLeft ? 'none' : 'background-color 0.2s',
             userSelect: 'none',
@@ -818,14 +934,43 @@ function EditorPage() {
             </select>
           </div>
 
+          {/* Sync status indicator */}
+          <div style={{ display: 'flex', alignItems: 'center', padding: '4px 8px', backgroundColor: '#1e1e1e', borderBottom: '1px solid #333' }}>
+            <span style={{
+              width: 8, height: 8, borderRadius: '50%',
+              backgroundColor: syncStatus === 'green' ? '#4ade80' : syncStatus === 'yellow' ? '#facc15' : '#f87171',
+              display: 'inline-block', marginRight: 8,
+            }} title={`Sync: ${syncStatus}`} />
+            <span style={{ fontSize: 11, color: '#888' }}>
+              {isFileSyncing ? 'Syncing file...' : syncStatus === 'green' ? 'Synced' : syncStatus === 'yellow' ? 'Saving...' : 'Error'}
+            </span>
+          </div>
+
           <Editor
+            ref={editorRef}
             socketRef={socketRef}
             roomId={roomId}
             onCodeChange={handleCodeChange}
             activeFile={activeFile}
             fileContent={fileContents[activeFile] || ""}
             language={activeFile ? getLanguageFromFile(activeFile) : "javascript"}
+            fileVersionsRef={fileVersionsRef}
+            isEditorFrozen={isReconnecting || isFileSyncing}
           />
+
+          {/* Reconnecting overlay */}
+          {isReconnecting && (
+            <div style={{
+              position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+              backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex',
+              alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+            }}>
+              <div style={{ color: '#fff', textAlign: 'center' }}>
+                <div style={{ fontSize: 24, marginBottom: 8 }}>🔄</div>
+                <div>Reconnecting...</div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Right Resize Handle */}

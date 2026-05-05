@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import "codemirror/mode/javascript/javascript";
 import "codemirror/mode/python/python";
 import "codemirror/mode/clike/clike";
@@ -14,6 +14,7 @@ import "codemirror/addon/selection/mark-selection";
 import "codemirror/lib/codemirror.css";
 import CodeMirror from "codemirror";
 import { ACTIONS } from "../Actions";
+import { generateOpId, createFlushableDebounce, transformCursor, sanitizePath } from "../syncUtils";
 
 // Helper function to generate consistent color from username
 const getUserColor = (username) => {
@@ -32,39 +33,61 @@ const getUserColorWithAlpha = (username, alpha = 0.3) => {
     hash = username.charCodeAt(i) + ((hash << 5) - hash);
   }
   const hue = hash % 360;
-  // Convert HSL to RGB for better alpha support
   const l = 60;
   const s = 70;
   const c = (1 - Math.abs(2 * l / 100 - 1)) * s / 100;
   const x = c * (1 - Math.abs((hue / 60) % 2 - 1));
   const m = l / 100 - c / 2;
   let r = 0, g = 0, b = 0;
-  
+
   if (hue >= 0 && hue < 60) { r = c; g = x; b = 0; }
   else if (hue >= 60 && hue < 120) { r = x; g = c; b = 0; }
   else if (hue >= 120 && hue < 180) { r = 0; g = c; b = x; }
   else if (hue >= 180 && hue < 240) { r = 0; g = x; b = c; }
   else if (hue >= 240 && hue < 300) { r = x; g = 0; b = c; }
   else { r = c; g = 0; b = x; }
-  
+
   r = Math.round((r + m) * 255);
   g = Math.round((g + m) * 255);
   b = Math.round((b + m) * 255);
-  
+
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 };
 
-function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, language }) {
+const MAX_QUEUE_SIZE = 50; // FIX 8: Backpressure threshold
+
+const Editor = forwardRef(function Editor(
+  { socketRef, roomId, onCodeChange, activeFile, fileContent, language, fileVersionsRef, isEditorFrozen },
+  ref
+) {
   const editorRef = useRef(null);
-  const remoteCursorsRef = useRef({}); // Track remote cursor widgets
-  const remoteSelectionsRef = useRef({}); // Track remote selections
-  const suppressRemoteChangeRef = useRef(false); // Flag to prevent circular updates
+  const remoteCursorsRef = useRef({});
+  const remoteSelectionsRef = useRef({});
+  const suppressRemoteChangeRef = useRef(false);
   const currentFileRef = useRef(activeFile);
+  const pendingOpsQueueRef = useRef([]);
+  const debouncedEmitRef = useRef(null);
+
+  // Expose flush() to parent via ref
+  useImperativeHandle(ref, () => ({
+    flush: () => {
+      if (debouncedEmitRef.current) debouncedEmitRef.current.flush();
+    },
+    getEditor: () => editorRef.current,
+    getPendingOpsQueue: () => pendingOpsQueueRef.current,
+  }));
 
   // Keep currentFileRef in sync with activeFile prop
   useEffect(() => {
     currentFileRef.current = activeFile;
   }, [activeFile]);
+
+  // BUG 15: Freeze/unfreeze editor
+  useEffect(() => {
+    if (editorRef.current) {
+      editorRef.current.setOption('readOnly', isEditorFrozen ? true : false);
+    }
+  }, [isEditorFrozen]);
 
   useEffect(() => {
     const init = async () => {
@@ -78,80 +101,126 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
           lineNumbers: true,
         }
       );
-      
+
       editorRef.current = editor;
       editor.setSize(null, "100%");
 
-      // Send cursor position changes
+      // ── Sync helper: emits CODE_CHANGE with proper versioning ──
+      const syncCurrentContent = (filePath) => {
+        const code = editor.getValue();
+
+        // Update React state (EditorPage) — only on actual sync, not per keystroke
+        onCodeChange(code, filePath);
+
+        // Increment version ONCE for this batch
+        if (!fileVersionsRef.current[filePath]) fileVersionsRef.current[filePath] = 0;
+        fileVersionsRef.current[filePath] += 1;
+        const version = fileVersionsRef.current[filePath];
+        const opId = generateOpId();
+
+        // Backpressure check
+        const sameFileOps = pendingOpsQueueRef.current.filter(op => op.filePath === filePath);
+        if (sameFileOps.length > MAX_QUEUE_SIZE) {
+          pendingOpsQueueRef.current = pendingOpsQueueRef.current.filter(op => op.filePath !== filePath);
+        }
+
+        // Push to pending queue
+        pendingOpsQueueRef.current.push({ opId, filePath, version, code, change: null });
+
+        // Emit full code (batched, no delta — safe for multi-keystroke batches)
+        socketRef.current.emit(ACTIONS.CODE_CHANGE, {
+          roomId, code, change: null, filePath, version, opId,
+        }, (ack) => handleAck(ack, opId, filePath));
+      };
+
+      // ── Flushable debounce — fires after 1s of no typing ──
+      debouncedEmitRef.current = createFlushableDebounce((filePath) => {
+        syncCurrentContent(filePath);
+      }, 1000);
+
+      // ── ACK handler ──
+      const handleAck = (ack, opId, filePath) => {
+        if (!ack) return;
+        if (ack.status === 'ok') {
+          // Remove from pending queue (do NOT overwrite fileVersionsRef — client version may be ahead)
+          pendingOpsQueueRef.current = pendingOpsQueueRef.current.filter(op => op.opId !== opId);
+        }
+        // conflict is handled by EditorPage's CODE_CONFLICT listener
+      };
+
+      // Send cursor position changes (BUG 4: include filePath)
       editor.on("cursorActivity", () => {
         if (!suppressRemoteChangeRef.current) {
           const cursor = editor.getCursor();
           const selection = editor.listSelections()[0];
-          
           socketRef.current.emit(ACTIONS.CURSOR_CHANGE, {
             roomId,
             cursor,
             selection,
+            filePath: currentFileRef.current,
           });
         }
       });
 
-      // Send code changes - send the actual change delta instead of full code
+      // ── onChange: sole CODE_CHANGE emitter (BUG 11) ──
+      // User types freely — NO state updates or version increments per keystroke.
+      // Sync happens on: spacebar, enter, paste, or 1s idle.
       editor.on("change", (instance, changeObj) => {
         const { origin } = changeObj;
-        
-        // Skip changes from setValue and when suppressed for remote updates
-        if (origin === "setValue" || suppressRemoteChangeRef.current) {
-          return;
+        if (origin === "setValue" || suppressRemoteChangeRef.current) return;
+
+        const filePath = sanitizePath(currentFileRef.current || '/root/index.js');
+
+        // Detect spacebar, enter (empty string in text array = newline), or paste
+        const isBreakChar = changeObj.text.some(t => t.includes(' ') || t === '');
+        const isPaste = origin === 'paste';
+
+        if (isBreakChar || isPaste) {
+          // Immediate sync: cancel pending debounce and sync NOW
+          debouncedEmitRef.current.cancel();
+          syncCurrentContent(filePath);
+        } else {
+          // Regular keystroke: just schedule debounce, let user type freely
+          debouncedEmitRef.current.call(filePath);
         }
-        
-        const code = instance.getValue();
-        // Ensure filePath is always defined (fallback to index.js if not set)
-        const filePath = currentFileRef.current || '/root/index.js';
-        
-        // Debug log
-        console.log("✍️ Local change detected:", { filePath, codeLength: code.length, codePreview: code.substring(0, 50) });
-        
-        onCodeChange(code, filePath);
-        
-        // Send the change delta for better collaboration
-        socketRef.current.emit(ACTIONS.CODE_CHANGE, {
-          roomId,
-          code,
-          change: {
-            from: changeObj.from,
-            to: changeObj.to,
-            text: changeObj.text,
-            origin: changeObj.origin
-          },
-          filePath: filePath,
-        });
-        console.log("📤 CODE_CHANGE emitted to server:", { filePath, roomId });
       });
     };
 
     init();
+
+    // BUG 15: Cleanup CodeMirror on unmount
+    return () => {
+      if (editorRef.current) {
+        editorRef.current.toTextArea();
+        editorRef.current = null;
+      }
+    };
   }, []);
 
-  // Update editor content when active file changes (NOT when fileContent updates alone)
-  // BUT we DO need to update on initial fileContent load from MongoDB
+  // Update editor content when active file changes or external content arrives
   useEffect(() => {
     if (editorRef.current && activeFile) {
       currentFileRef.current = activeFile;
+
+      // Skip setValue if editor already has this content — prevents feedback loop
+      // during local typing (type → handleCodeChange → fileContent prop change → here)
+      const currentContent = editorRef.current.getValue();
+      if (currentContent === (fileContent || "")) {
+        // Still update language mode if needed
+        if (language) editorRef.current.setOption("mode", language);
+        return;
+      }
+
       suppressRemoteChangeRef.current = true;
-      
-      console.log("📂 Editor loading file:", { activeFile, fileContent: fileContent?.substring(0, 50), fileContentLength: fileContent?.length });
-      
+
       const cursor = editorRef.current.getCursor();
-      // Load the file content passed in as prop (this is fileContents[activeFile] from EditorPage)
       editorRef.current.setValue(fileContent || "");
       editorRef.current.setCursor(cursor);
-      
-      // Change language mode based on file
+
       if (language) {
         editorRef.current.setOption("mode", language);
       }
-      
+
       setTimeout(() => {
         suppressRemoteChangeRef.current = false;
       }, 10);
@@ -161,13 +230,13 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
   // Handle incoming code and cursor changes
   useEffect(() => {
     if (socketRef.current) {
-      // Handle code changes - apply delta changes instead of replacing entire document
-      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code, change, filePath }) => {
-        // Only update if the change is for the currently active file
-        if (editorRef.current && (!filePath || filePath === currentFileRef.current)) {
+      // Handle remote code changes — only apply delta to active file's editor
+      socketRef.current.on(ACTIONS.CODE_CHANGE, ({ code, change, filePath, version }) => {
+        // BUG 4: Only apply to editor if this is the active file
+        if (editorRef.current && filePath && filePath === currentFileRef.current) {
           suppressRemoteChangeRef.current = true;
-          
-          // If we have change delta, apply it; otherwise use full code sync
+
+          // FIX 6: Apply delta if available, otherwise full sync
           if (change && change.from && change.to && change.text) {
             editorRef.current.replaceRange(
               change.text.join('\n'),
@@ -175,29 +244,48 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
               change.to,
               '+input'
             );
+
+            // FIX 9: Transform all remote cursor bookmarks after applying delta
+            Object.keys(remoteCursorsRef.current).forEach((sid) => {
+              const bookmark = remoteCursorsRef.current[sid];
+              if (bookmark) {
+                const pos = bookmark.find();
+                if (pos) {
+                  const newPos = transformCursor(pos, change);
+                  if (newPos && (newPos.line !== pos.line || newPos.ch !== pos.ch)) {
+                    bookmark.clear();
+                    remoteCursorsRef.current[sid] = editorRef.current.setBookmark(newPos, {
+                      widget: bookmark.widgetNode,
+                      insertLeft: true,
+                    });
+                  }
+                }
+              }
+            });
           } else if (code !== null) {
-            // Fallback to full sync (for initial sync)
             const cursor = editorRef.current.getCursor();
             const scrollInfo = editorRef.current.getScrollInfo();
-            
             editorRef.current.setValue(code);
             editorRef.current.setCursor(cursor);
             editorRef.current.scrollTo(scrollInfo.left, scrollInfo.top);
           }
-          
+
           setTimeout(() => {
             suppressRemoteChangeRef.current = false;
           }, 10);
         }
+        // NOTE: Background file caching is handled by EditorPage's CODE_CHANGE listener
       });
 
-      // Handle remote cursor changes
-      socketRef.current.on(ACTIONS.CURSOR_CHANGE, ({ socketId, username, cursor, selection }) => {
+      // Handle remote cursor changes (BUG 4: filter by filePath)
+      socketRef.current.on(ACTIONS.CURSOR_CHANGE, ({ socketId, username, cursor, selection, filePath }) => {
         if (!editorRef.current) return;
+        // Only show cursors for the same file
+        if (filePath && filePath !== currentFileRef.current) return;
 
         const color = getUserColor(username);
         const bgColor = getUserColorWithAlpha(username, 0.6);
-        
+
         // Remove old cursor if exists
         if (remoteCursorsRef.current[socketId]) {
           remoteCursorsRef.current[socketId].clear();
@@ -213,7 +301,7 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
         cursorElement.style.height = `${cursorCoords.bottom - cursorCoords.top}px`;
         cursorElement.style.position = "absolute";
         cursorElement.style.zIndex = "10";
-        
+
         // Add username label
         const label = document.createElement("span");
         label.textContent = username;
@@ -235,23 +323,17 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
 
         // Highlight selection if exists
         const hasSelection = selection && selection.anchor && selection.head &&
-          (selection.anchor.line !== selection.head.line || 
+          (selection.anchor.line !== selection.head.line ||
            selection.anchor.ch !== selection.head.ch);
-        
+
         if (hasSelection) {
-          // Normalize selection order - ensure 'from' is before 'to'
           let from = selection.anchor;
           let to = selection.head;
-          
-          // Compare positions and swap if necessary
           if (from.line > to.line || (from.line === to.line && from.ch > to.ch)) {
             [from, to] = [to, from];
           }
-          
-          // Create unique class name for this user
+
           const selectionClass = `remote-selection-${socketId.replace(/[^a-zA-Z0-9]/g, '')}`;
-          
-          // Inject CSS for this selection
           const styleId = `style-${socketId.replace(/[^a-zA-Z0-9]/g, '')}`;
           let styleElement = document.getElementById(styleId);
           if (!styleElement) {
@@ -265,17 +347,13 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
               background: ${bgColor} !important;
             }
           `;
-          
+
           try {
-            const mark = editorRef.current.markText(
-              from,
-              to,
-              {
-                className: selectionClass,
-                inclusiveLeft: true,
-                inclusiveRight: true,
-              }
-            );
+            const mark = editorRef.current.markText(from, to, {
+              className: selectionClass,
+              inclusiveLeft: true,
+              inclusiveRight: true,
+            });
             remoteSelectionsRef.current[socketId] = mark;
           } catch (err) {
             // Silent error handling
@@ -293,7 +371,6 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
           remoteSelectionsRef.current[socketId].clear();
           delete remoteSelectionsRef.current[socketId];
         }
-        // Remove injected style
         const styleElement = document.getElementById(`style-${socketId}`);
         if (styleElement) {
           styleElement.remove();
@@ -315,6 +392,6 @@ function Editor({ socketRef, roomId, onCodeChange, activeFile, fileContent, lang
       <textarea id="realtimeEditor"></textarea>
     </div>
   );
-}
+});
 
 export default Editor;

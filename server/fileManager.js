@@ -9,6 +9,19 @@ if (!fs.existsSync(PROJECTS_DIR)) {
   fs.mkdirSync(PROJECTS_DIR, { recursive: true });
 }
 
+// ── Path Traversal Guard (BUG 14) ──────────────────────────────
+function validatePath(roomId, filePath) {
+  const projectRoot = path.resolve(PROJECTS_DIR, roomId);
+  const fileName = filePath.split('/').pop();
+  const folderPath = filePath.split('/').slice(1, -1).join('/');
+  const resolved = path.resolve(PROJECTS_DIR, roomId, folderPath, fileName);
+
+  if (!resolved.startsWith(projectRoot)) {
+    throw new Error(`Path traversal blocked: ${filePath} resolves outside project directory`);
+  }
+  return resolved;
+}
+
 // Create project directory
 function createProjectDirectory(roomId) {
   const projectPath = path.join(PROJECTS_DIR, roomId);
@@ -20,32 +33,43 @@ function createProjectDirectory(roomId) {
 
 // Get file path for a specific file in a project
 function getFilePath(roomId, filePath) {
-  // Convert /root/index.js to projects/roomId/index.js
-  const fileName = filePath.split('/').pop();
-  const folderPath = filePath.split('/').slice(1, -1).join('/');
-  
-  const fullPath = path.join(PROJECTS_DIR, roomId, folderPath, fileName);
-  
+  // Validate + resolve (throws on traversal)
+  const fullPath = validatePath(roomId, filePath);
+
   // Ensure the directory exists
   const dirName = path.dirname(fullPath);
   if (!fs.existsSync(dirName)) {
     fs.mkdirSync(dirName, { recursive: true });
   }
-  
+
   return fullPath;
 }
 
-// Save file content to disk
+// Save file content to disk (with retry-once logic)
 function saveFile(roomId, filePath, content) {
-  try {
-    const fullPath = getFilePath(roomId, filePath);
-    fs.writeFileSync(fullPath, content, 'utf-8');
-    console.log(`Saved file: ${fullPath}`);
-    return true;
-  } catch (err) {
-    console.error(`Error saving file ${filePath}:`, err);
-    return false;
-  }
+  const attempt = (retryCount) => {
+    try {
+      const fullPath = getFilePath(roomId, filePath);
+      fs.writeFileSync(fullPath, content, 'utf-8');
+
+      // Read-back verification
+      const readBack = fs.readFileSync(fullPath, 'utf-8');
+      if (readBack !== content) {
+        throw new Error('Read-back verification failed: content mismatch');
+      }
+
+      return { success: true, error: null };
+    } catch (err) {
+      if (retryCount > 0) {
+        console.warn(`Retrying save for ${filePath}:`, err.message);
+        return attempt(retryCount - 1);
+      }
+      console.error(`Error saving file ${filePath}:`, err);
+      return { success: false, error: err.message };
+    }
+  };
+
+  return attempt(1); // 1 retry
 }
 
 // Read file content from disk
@@ -72,25 +96,25 @@ function getAllFiles(roomId) {
     }
 
     const fileContents = {};
-    
+
     function walkDir(dir, baseDir = '') {
       const files = fs.readdirSync(dir);
-      
+
       for (const file of files) {
         const fullPath = path.join(dir, file);
         const stat = fs.statSync(fullPath);
-        
+
         if (stat.isDirectory()) {
           walkDir(fullPath, baseDir + '/' + file);
         } else {
           const relativePath = path.relative(projectPath, fullPath);
-          const fileKey = '/root/' + relativePath.replace(/\\/g, '/');
+          const fileKey = '/root/' + relativePath.replace(/\\\\/g, '/');
           const content = fs.readFileSync(fullPath, 'utf-8');
           fileContents[fileKey] = content;
         }
       }
     }
-    
+
     walkDir(projectPath);
     return fileContents;
   } catch (err) {
@@ -119,11 +143,11 @@ function deleteProject(roomId) {
 function initializeProject(roomId, fileContents) {
   try {
     createProjectDirectory(roomId);
-    
+
     for (const [filePath, content] of Object.entries(fileContents)) {
       saveFile(roomId, filePath, content);
     }
-    
+
     console.log(`Initialized project ${roomId} with ${Object.keys(fileContents).length} files`);
     return true;
   } catch (err) {

@@ -56,6 +56,9 @@ const roomHosts = {}; // Track the host (first user) of each room
 const pendingJoinRequests = {}; // Track users waiting for approval
 const roomFileStructures = {}; // Track file structure for each room
 const roomFileContents = {}; // Track file contents for each room
+const fileVersions = {}; // { roomId: { filePath: number } } — per-file monotonic version
+const processedOps = {}; // { roomId: Map<opId, newVersion> } — dedup with FIFO eviction
+const MAX_PROCESSED_OPS = 1000;
 
 // Helper function to get item at path in file structure
 const getItemAtPath = (structure, path) => {
@@ -105,7 +108,7 @@ const deleteItemAtPath = (structure, path) => {
   }
 };
 
-// Helper function to rename item at path
+// Helper function to rename item at path (BUG 12 fix: always re-key)
 const renameItemAtPath = (structure, oldPath, newPath) => {
   const item = getItemAtPath(structure, oldPath);
   if (!item) return;
@@ -113,14 +116,9 @@ const renameItemAtPath = (structure, oldPath, newPath) => {
   const newName = newPath.split('/').pop();
   item.name = newName;
   
-  const oldParts = oldPath.split('/').filter(p => p && p !== 'root');
-  const newParts = newPath.split('/').filter(p => p && p !== 'root');
-  
-  // If parent directory changed, move the item
-  if (oldParts.slice(0, -1).join('/') !== newParts.slice(0, -1).join('/')) {
-    deleteItemAtPath(structure, oldPath);
-    setItemAtPath(structure, newPath, item);
-  }
+  // Always delete old key and insert new key (even same parent dir)
+  deleteItemAtPath(structure, oldPath);
+  setItemAtPath(structure, newPath, item);
 };
 
 const getAllConnectedClients = (roomId) => {
@@ -242,45 +240,109 @@ io.on("connection", (socket) => {
     io.to(socketId).emit(ACTIONS.JOIN_REJECTED, { roomId });
   });
 
-  // sync the code - broadcast changes to all other users in the room
-  socket.on(ACTIONS.CODE_CHANGE, ({ roomId, code, change, filePath }) => {
-    console.log("📨 CODE_CHANGE received from client:", { userId: socket.id, roomId, filePath, codeLength: code?.length });
-    
-    socket.in(roomId).emit(ACTIONS.CODE_CHANGE, { code, change, filePath });
-    console.log("📤 CODE_CHANGE broadcasted to room:", { roomId, filePath });
-    
-    // Update file content in room storage
-    if (filePath && roomFileContents[roomId]) {
-      roomFileContents[roomId][filePath] = code;
-      
-      // Save to MongoDB immediately
-      Project.findOneAndUpdate(
-        { roomId },
-        {
-          fileContents: roomFileContents[roomId],
-          updatedAt: new Date(),
-        },
-        { upsert: true }
-      ).then(() => {
-        // Broadcast FILE_STRUCTURE_UPDATE to ALL users (including sender) so fileContents state updates from MongoDB
-        io.to(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
-          fileContents: roomFileContents[roomId],
-          fileStructure: roomFileStructures[roomId] || {},
-        });
-        console.log("📡 FILE_STRUCTURE_UPDATE broadcast to all users after CODE_CHANGE");
-      }).catch(err => console.error("Error saving to MongoDB:", err));
-      
-      console.log("💾 File saved to MongoDB:", { roomId, filePath });
+  // ── CODE_CHANGE handler (BUGs 1,8,9,10,11 + precision fixes 2,4,5,6) ──
+  socket.on(ACTIONS.CODE_CHANGE, ({ roomId, code, change, filePath, version, opId }, ackCallback) => {
+    // BUG 8: Room membership check
+    if (!socket.rooms.has(roomId)) {
+      socket.emit(ACTIONS.STALE_EVENT_REJECTED, { reason: 'Not in room', filePath });
+      if (typeof ackCallback === 'function') ackCallback({ status: 'rejected' });
+      return;
     }
+
+    // Initialize structures if missing
+    if (!roomFileContents[roomId]) roomFileContents[roomId] = {};
+    if (!fileVersions[roomId]) fileVersions[roomId] = {};
+    if (!processedOps[roomId]) processedOps[roomId] = new Map();
+    if (fileVersions[roomId][filePath] === undefined) fileVersions[roomId][filePath] = 0;
+
+    // FIX 5: Server-side dedup — if already processed, return cached ACK
+    if (opId && processedOps[roomId].has(opId)) {
+      const cachedVersion = processedOps[roomId].get(opId);
+      if (typeof ackCallback === 'function') ackCallback({ status: 'ok', newVersion: cachedVersion });
+      return;
+    }
+
+    // FIX 2: Version validation — client must send serverVersion + 1
+    const serverVersion = fileVersions[roomId][filePath];
+    if (version !== undefined && version !== serverVersion + 1) {
+      // Version mismatch — emit conflict with authoritative state
+      socket.emit(ACTIONS.CODE_CONFLICT, {
+        filePath,
+        expectedVersion: serverVersion + 1,
+        serverVersion,
+        latestContent: roomFileContents[roomId][filePath] || '',
+      });
+      if (typeof ackCallback === 'function') ackCallback({ status: 'conflict', serverVersion });
+      return;
+    }
+
+    // FIX 4: ALWAYS update in-memory (memory is source of truth)
+    const newVersion = serverVersion + 1;
+    fileVersions[roomId][filePath] = newVersion;
+    roomFileContents[roomId][filePath] = code;
+
+    // FIX 5: Record in dedup map
+    if (opId) {
+      processedOps[roomId].set(opId, newVersion);
+      if (processedOps[roomId].size > MAX_PROCESSED_OPS) {
+        const firstKey = processedOps[roomId].keys().next().value;
+        processedOps[roomId].delete(firstKey);
+      }
+    }
+
+    // FIX 6: Broadcast change delta + full code to room (excluding sender)
+    socket.in(roomId).emit(ACTIONS.CODE_CHANGE, {
+      code, change, filePath, version: newVersion,
+    });
+
+    // ACK the sender
+    if (typeof ackCallback === 'function') {
+      ackCallback({ status: 'ok', newVersion });
+    }
+
+    // FIX 4: Persist to DB asynchronously (best-effort, memory already updated)
+    Project.findOneAndUpdate(
+      { roomId },
+      { fileContents: roomFileContents[roomId], updatedAt: new Date() },
+      { upsert: true }
+    ).catch(async (err) => {
+      console.error('DB save failed, retrying once:', err.message);
+      try {
+        await Project.findOneAndUpdate(
+          { roomId },
+          { fileContents: roomFileContents[roomId], updatedAt: new Date() },
+          { upsert: true }
+        );
+      } catch (err2) {
+        console.error('DB save retry failed:', err2.message);
+        io.to(socket.id).emit(ACTIONS.SAVE_ERROR, { filePath, error: err2.message });
+      }
+    });
+    // NOTE: FILE_STRUCTURE_UPDATE is NOT broadcast here (BUG 11 fix)
   });
-  
-  // sync cursor positions
-  socket.on(ACTIONS.CURSOR_CHANGE, ({ roomId, cursor, selection }) => {
+
+  // ── REQUEST_FILE_SYNC handler (BUGs 3, 5) ──
+  socket.on(ACTIONS.REQUEST_FILE_SYNC, ({ roomId, filePath, seq }) => {
+    const content = (roomFileContents[roomId] && roomFileContents[roomId][filePath]) || '';
+    const version = (fileVersions[roomId] && fileVersions[roomId][filePath]) || 0;
+    socket.emit(ACTIONS.FILE_SYNC_RESPONSE, { filePath, content, version, seq });
+  });
+
+  // ── RECONNECT_SYNC handler (BUG 6) ──
+  socket.on(ACTIONS.RECONNECT_SYNC_START, ({ roomId, filePath }) => {
+    const content = (roomFileContents[roomId] && roomFileContents[roomId][filePath]) || '';
+    const version = (fileVersions[roomId] && fileVersions[roomId][filePath]) || 0;
+    socket.emit(ACTIONS.RECONNECT_SYNC_DONE, { filePath, content, version });
+  });
+
+  // sync cursor positions (BUG 4: add filePath passthrough)
+  socket.on(ACTIONS.CURSOR_CHANGE, ({ roomId, cursor, selection, filePath }) => {
     socket.in(roomId).emit(ACTIONS.CURSOR_CHANGE, {
       socketId: socket.id,
       username: userSocketMap[socket.id],
       cursor,
       selection,
+      filePath,
     });
   });
   
@@ -317,30 +379,27 @@ io.on("connection", (socket) => {
     } catch (err) {
       console.error("Error in FILE_STRUCTURE_SYNC:", err);
     }
+
+    // Initialize fileVersions for this room if not present
+    if (!fileVersions[roomId]) fileVersions[roomId] = {};
+    const contents = roomFileContents[roomId] || {};
+    for (const fp of Object.keys(contents)) {
+      if (fileVersions[roomId][fp] === undefined) fileVersions[roomId][fp] = 0;
+    }
     
-    // Send the current server state to BOTH the new user AND all existing users in the room
-    // This ensures everyone stays in sync with MongoDB (the source of truth)
+    // Send the current server state to the joining user
     const filesToSend = roomFileContents[roomId] || {};
-    console.log("📤 FILE_STRUCTURE_UPDATE sending to client:", { 
-      socketId, 
-      roomId, 
-      files: Object.keys(filesToSend),
-      fileContents: filesToSend
-    });
     
-    // Update only the joining user
     io.to(socketId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
       fileStructure: roomFileStructures[roomId],
       fileContents: filesToSend,
     });
     
-    // ALSO broadcast to all other users in the room to keep them in sync
+    // Also broadcast to existing users to keep them in sync on join
     socket.in(roomId).emit(ACTIONS.FILE_STRUCTURE_UPDATE, {
       fileStructure: roomFileStructures[roomId],
       fileContents: filesToSend,
     });
-    
-    console.log("📢 FILE_STRUCTURE_UPDATE broadcasted to all users in room:", { roomId });
   });
   
   // File operations - broadcast to all users in room
@@ -540,6 +599,17 @@ io.on("connection", (socket) => {
               clients: updatedClients,
             });
           });
+
+          // BUG 17: Forward pending join requests to new host
+          if (pendingJoinRequests[roomId] && pendingJoinRequests[roomId].length > 0) {
+            pendingJoinRequests[roomId].forEach(({ socketId: reqSid, username: reqUser }) => {
+              io.to(newHost.socketId).emit(ACTIONS.JOIN_REQUEST, {
+                socketId: reqSid,
+                username: reqUser,
+                roomId,
+              });
+            });
+          }
         }
       } else {
         // If a non-host leaves, just notify others
