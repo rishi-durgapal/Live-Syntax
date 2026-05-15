@@ -26,6 +26,7 @@ const languageConfig = {
 // Enable CORS
 const allowedOrigins = [
   "http://localhost:3000",
+  "http://localhost:3001",
   "http://localhost:5002",
   "https://live-syntax.vercel.app",
   process.env.FRONTEND_URL
@@ -740,27 +741,33 @@ app.post("/compile", async (req, res) => {
     return res.status(400).json({ error: `Unsupported language: ${language}` });
   }
 
+  const clientId = process.env.JDOODLE_CLIENT_ID;
+  const clientSecret = process.env.JDOODLE_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    return res.status(500).json({ error: "JDoodle API credentials not configured in server/.env" });
+  }
+
   try {
-    // Map our languages to Glot.io languages
-    const glotLanguages = {
-      python3: "python",
-      java: "java",
-      cpp: "cpp",
-      c: "c"
+    // JDoodle language mapping
+    const jdoodleLanguages = {
+      python3: { language: "python3", versionIndex: "4" },
+      java: { language: "java", versionIndex: "4" },
+      cpp: { language: "cpp", versionIndex: "5" },
+      c: { language: "c", versionIndex: "5" }
     };
     
-    const glotLang = glotLanguages[language];
-    if (!glotLang) {
-      return res.status(400).json({ error: `Unsupported language: ${language}` });
+    const jdoodleConfig = jdoodleLanguages[language];
+    if (!jdoodleConfig) {
+      return res.status(400).json({ error: `Unsupported language for compilation: ${language}` });
     }
     
-    const response = await axios.post(`https://glot.io/api/run/${glotLang}`, {
-      files: [
-        {
-          name: `main.${languageConfig[language].extension}`,
-          content: code
-        }
-      ],
+    const response = await axios.post(`https://api.jdoodle.com/v1/execute`, {
+      clientId: clientId,
+      clientSecret: clientSecret,
+      script: code,
+      language: jdoodleConfig.language,
+      versionIndex: jdoodleConfig.versionIndex,
       stdin: input
     }, {
       headers: {
@@ -772,14 +779,17 @@ app.post("/compile", async (req, res) => {
     const result = response.data;
     
     res.json({
-      output: result.stdout || result.stderr || "No output",
-      error: result.stderr || null
+      output: result.output || "",
+      error: result.error || null,
+      memory: result.memory,
+      cpuTime: result.cpuTime
     });
 
   } catch (error) {
+    console.error("Compilation error:", error);
     res.status(500).json({ 
       error: "Failed to compile code",
-      details: error.message
+      details: error.response?.data?.error || error.message
     });
   }
 });
